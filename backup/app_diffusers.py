@@ -1,0 +1,254 @@
+"""
+BarunVision - Z-Image-Turbo 기반 이미지 생성 웹 UI (PyTorch/Diffusers 버전)
+
+사용법:
+    python app.py
+
+브라우저에서 http://localhost:7860 접속
+
+백업 날짜: 2025-12-09
+변경 사유: MLX 버전으로 전환
+"""
+
+import os
+from datetime import datetime
+from pathlib import Path
+
+import gradio as gr
+import torch
+from diffusers import ZImagePipeline
+from PIL import Image
+
+# 출력 디렉토리 설정
+OUTPUT_DIR = Path("outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# 전역 파이프라인 (lazy loading)
+_pipeline = None
+
+
+def get_pipeline():
+    """파이프라인을 로드하거나 캐시된 인스턴스 반환."""
+    global _pipeline
+    if _pipeline is None:
+        print("🚀 Z-Image-Turbo 모델 로딩 중...")
+        _pipeline = ZImagePipeline.from_pretrained(
+            "Tongyi-MAI/Z-Image-Turbo",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+
+        # GPU 사용 가능 시 CUDA로 이동
+        if torch.cuda.is_available():
+            _pipeline.to("cuda")
+            print("✅ CUDA GPU에서 실행")
+        elif torch.backends.mps.is_available():
+            _pipeline.to("mps")
+            _pipeline.enable_attention_slicing()
+            print("✅ Apple MPS에서 실행 (attention slicing 활성화)")
+        else:
+            # CPU 전용 - offload 없이 직접 실행
+            _pipeline.to("cpu")
+            _pipeline.enable_attention_slicing()
+            print("⚠️ CPU에서 실행 (느릴 수 있음, attention slicing 활성화)")
+
+        print("✅ 모델 로딩 완료!")
+
+    return _pipeline
+
+
+def generate_image(
+    prompt: str,
+    width: int,
+    height: int,
+    num_steps: int,
+    seed: int,
+    save_image: bool,
+) -> tuple[Image.Image, str]:
+    """
+    프롬프트로 이미지 생성.
+
+    Args:
+        prompt: 이미지 설명 텍스트
+        width: 이미지 너비
+        height: 이미지 높이
+        num_steps: 추론 스텝 수 (8-12 권장)
+        seed: 랜덤 시드 (-1이면 랜덤)
+        save_image: 이미지 저장 여부
+
+    Returns:
+        생성된 이미지와 상태 메시지
+    """
+    if not prompt.strip():
+        return None, "❌ 프롬프트를 입력해주세요."
+
+    try:
+        pipe = get_pipeline()
+
+        # 시드 설정
+        if seed == -1:
+            seed = torch.randint(0, 2**32, (1,)).item()
+
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        generator = torch.Generator(device).manual_seed(int(seed))
+
+        print(f"🎨 이미지 생성 중... (seed: {seed})")
+
+        # 이미지 생성
+        result = pipe(
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_inference_steps=num_steps,
+            guidance_scale=0.0,  # Turbo 모델은 0.0 필수
+            generator=generator,
+        )
+
+        image = result.images[0]
+
+        # 이미지 저장
+        status = f"✅ 생성 완료! (seed: {seed})"
+        if save_image:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = OUTPUT_DIR / f"barunvision_{timestamp}_{seed}.png"
+            image.save(filename)
+            status += f"\n💾 저장됨: {filename}"
+
+        return image, status
+
+    except Exception as e:
+        return None, f"❌ 오류 발생: {str(e)}"
+
+
+def create_ui():
+    """Gradio UI 생성."""
+
+    with gr.Blocks() as app:
+
+        gr.HTML("""
+        <div class="title">
+            <h1>🎨 BarunVision</h1>
+            <p>Z-Image-Turbo 기반 AI 이미지 생성기</p>
+        </div>
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                # 입력 섹션
+                prompt = gr.Textbox(
+                    label="프롬프트",
+                    placeholder="생성하고 싶은 이미지를 설명해주세요...",
+                    lines=4,
+                    max_lines=8,
+                )
+
+                with gr.Row():
+                    width = gr.Slider(
+                        label="너비",
+                        minimum=512,
+                        maximum=1536,
+                        value=512,
+                        step=64,
+                    )
+                    height = gr.Slider(
+                        label="높이",
+                        minimum=512,
+                        maximum=1536,
+                        value=512,
+                        step=64,
+                    )
+
+                with gr.Row():
+                    num_steps = gr.Slider(
+                        label="스텝 수",
+                        minimum=4,
+                        maximum=20,
+                        value=6,
+                        step=1,
+                        info="6-9 권장 (MPS: 낮을수록 빠름)",
+                    )
+                    seed = gr.Number(
+                        label="시드",
+                        value=-1,
+                        precision=0,
+                        info="-1 = 랜덤",
+                    )
+
+                save_image = gr.Checkbox(
+                    label="이미지 자동 저장",
+                    value=True,
+                    info=f"저장 위치: {OUTPUT_DIR.absolute()}",
+                )
+
+                generate_btn = gr.Button(
+                    "🎨 이미지 생성",
+                    variant="primary",
+                    size="lg",
+                )
+
+            with gr.Column(scale=1):
+                # 출력 섹션
+                output_image = gr.Image(
+                    label="생성된 이미지",
+                    type="pil",
+                    height=512,
+                )
+                status = gr.Textbox(
+                    label="상태",
+                    interactive=False,
+                )
+
+        # 예제
+        gr.Examples(
+            examples=[
+                ["A majestic mountain landscape at sunset with snow-capped peaks and a crystal clear lake reflection"],
+                ["귀여운 하얀 고양이가 창가에서 낮잠을 자고 있는 모습, 따뜻한 햇살"],
+                ["Cyberpunk city street at night, neon lights, rain reflections, cinematic atmosphere"],
+                ["한복을 입은 여성이 벚꽃 나무 아래 서 있는 동양화 스타일"],
+                ["Delicious Korean bibimbap in a stone pot, food photography, top view"],
+            ],
+            inputs=[prompt],
+            label="예제 프롬프트",
+        )
+
+        # 이벤트 연결
+        generate_btn.click(
+            fn=generate_image,
+            inputs=[prompt, width, height, num_steps, seed, save_image],
+            outputs=[output_image, status],
+        )
+
+        # Enter 키로 생성
+        prompt.submit(
+            fn=generate_image,
+            inputs=[prompt, width, height, num_steps, seed, save_image],
+            outputs=[output_image, status],
+        )
+
+        gr.HTML("""
+        <div class="footer">
+            <p>Powered by <a href="https://huggingface.co/Tongyi-MAI/Z-Image-Turbo" target="_blank">Z-Image-Turbo</a> | BarunVision</p>
+        </div>
+        """)
+
+    return app
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("🎨 BarunVision 시작")
+    print("=" * 50)
+
+    # 첫 요청 시 모델이 로드됨 (lazy loading)
+    app = create_ui()
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,  # 공유 링크 생성하려면 True로 변경
+        theme=gr.themes.Soft(),
+        css="""
+        .title { text-align: center; margin-bottom: 1rem; }
+        .footer { text-align: center; margin-top: 1rem; opacity: 0.7; }
+        """,
+        head="<title>BarunVision</title>",
+    )

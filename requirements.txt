@@ -1,0 +1,7 @@
+torch>=2.0.0
+diffusers>=0.31.0
+transformers>=4.40.0
+accelerate>=0.25.0
+huggingface-hub>=0.20.0
+pillow>=10.0.0
+gradio>=4.0.0
