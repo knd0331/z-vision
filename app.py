@@ -30,6 +30,8 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 _backend = None
 _model = None
 _pipeline = None
+_is_generating = False
+_cancel_requested = False
 
 
 def detect_backend() -> str:
@@ -167,7 +169,25 @@ def get_diffusers_pipeline(device: str):
     return _pipeline
 
 
-def generate_diffusers(prompt: str, width: int, height: int, num_steps: int, seed: int, device: str) -> tuple[Image.Image, float]:
+def make_progress_callback(num_steps: int, progress_fn=None):
+    """Diffusers용 진행률 콜백 생성."""
+    def callback(pipeline, step, timestep, callback_kwargs):
+        global _cancel_requested
+        
+        # 진행률 업데이트
+        if progress_fn is not None:
+            progress_fn((step + 1) / num_steps, desc=f"Step {step + 1}/{num_steps}")
+        
+        # 취소 요청 확인
+        if _cancel_requested:
+            pipeline._interrupt = True
+        
+        return callback_kwargs
+    
+    return callback
+
+
+def generate_diffusers(prompt: str, width: int, height: int, num_steps: int, seed: int, device: str, progress_fn=None) -> tuple[Image.Image, float]:
     """PyTorch/Diffusers 백엔드로 이미지 생성."""
     import torch
     pipe = get_diffusers_pipeline(device)
@@ -177,6 +197,9 @@ def generate_diffusers(prompt: str, width: int, height: int, num_steps: int, see
 
     generator = torch.Generator(device if device != "cpu" else "cpu").manual_seed(int(seed))
 
+    # 진행률 콜백 생성
+    callback = make_progress_callback(num_steps, progress_fn)
+
     start_time = time.time()
     result = pipe(
         prompt=prompt,
@@ -185,6 +208,7 @@ def generate_diffusers(prompt: str, width: int, height: int, num_steps: int, see
         num_inference_steps=num_steps,
         guidance_scale=0.0,  # Turbo 모델은 0.0 필수
         generator=generator,
+        callback_on_step_end=callback,
     )
     gen_time = time.time() - start_time
 
@@ -195,6 +219,15 @@ def generate_diffusers(prompt: str, width: int, height: int, num_steps: int, see
 # Unified Generation
 # ============================================================
 
+def cancel_generation():
+    """생성 취소 요청."""
+    global _cancel_requested, _is_generating
+    if _is_generating:
+        _cancel_requested = True
+        return "⏹️ 취소 요청됨... 현재 스텝 완료 후 중단됩니다."
+    return "생성 중이 아닙니다."
+
+
 def generate_image(
     prompt: str,
     width: int,
@@ -202,9 +235,10 @@ def generate_image(
     num_steps: int,
     seed: int,
     save_image: bool,
+    progress=gr.Progress(),
 ) -> tuple[Image.Image, str]:
     """통합 이미지 생성 함수."""
-    global _backend
+    global _backend, _is_generating, _cancel_requested
 
     if not prompt.strip():
         return None, "❌ 프롬프트를 입력해주세요."
@@ -212,31 +246,54 @@ def generate_image(
     if _backend is None:
         return None, "❌ 사용 가능한 백엔드가 없습니다. PyTorch 또는 MLX를 설치해주세요."
 
+    if _is_generating:
+        return None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요."
+
     try:
+        _is_generating = True
+        _cancel_requested = False
+        
         print(f"🎨 이미지 생성 중... (backend: {_backend})")
+        progress(0, desc="생성 시작...")
 
         if _backend == "mlx":
+            # MLX는 콜백 미지원, 단순 진행률 표시
+            progress(0.1, desc="MLX 생성 중... (진행률 표시 미지원)")
             image, gen_time, used_seed = generate_mlx(prompt, width, height, num_steps, seed)
         else:
-            image, gen_time, used_seed = generate_diffusers(prompt, width, height, num_steps, seed, _backend)
+            # Diffusers는 콜백으로 진행률 표시
+            image, gen_time, used_seed = generate_diffusers(
+                prompt, width, height, num_steps, seed, _backend,
+                progress_fn=progress
+            )
+
+        # 취소 확인
+        if _cancel_requested:
+            _is_generating = False
+            _cancel_requested = False
+            return None, "⏹️ 생성이 취소되었습니다."
 
         # 상태 메시지
         backend_info = get_backend_info(_backend)
         status = f"✅ 생성 완료! ({backend_info['emoji']} {_backend.upper()}, seed: {used_seed}, {gen_time:.1f}초)"
 
         # 이미지 저장
-        if save_image:
+        if save_image and image is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = OUTPUT_DIR / f"zvision_{timestamp}_{used_seed}.png"
             image.save(filename)
             status += f"\n💾 저장됨: {filename}"
 
+        progress(1.0, desc="완료!")
         return image, status
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return None, f"❌ 오류 발생: {str(e)}"
+    finally:
+        _is_generating = False
+        _cancel_requested = False
 
 
 # ============================================================
@@ -315,12 +372,20 @@ def create_ui():
                     info=f"저장 위치: {OUTPUT_DIR.absolute()}",
                 )
 
-                generate_btn = gr.Button(
-                    "🎨 이미지 생성",
-                    variant="primary",
-                    size="lg",
-                    interactive=_backend is not None,
-                )
+                with gr.Row():
+                    generate_btn = gr.Button(
+                        "🎨 이미지 생성",
+                        variant="primary",
+                        size="lg",
+                        interactive=_backend is not None,
+                        scale=3,
+                    )
+                    cancel_btn = gr.Button(
+                        "⏹️ 취소",
+                        variant="stop",
+                        size="lg",
+                        scale=1,
+                    )
 
             with gr.Column(scale=1):
                 # 출력 섹션
@@ -359,6 +424,13 @@ def create_ui():
             fn=generate_image,
             inputs=[prompt, width, height, num_steps, seed, save_image],
             outputs=[output_image, status],
+        )
+
+        # 취소 버튼
+        cancel_btn.click(
+            fn=cancel_generation,
+            inputs=[],
+            outputs=[status],
         )
 
         gr.HTML("""

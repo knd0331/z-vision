@@ -2,22 +2,35 @@
 
 ## Project Overview
 
-Z-Image-Turbo 기반 AI 이미지 생성 Gradio 웹 애플리케이션
+Z-Vision: Z-Image-Turbo 기반 AI 이미지 생성 Gradio 웹 애플리케이션
 
 ## Tech Stack
 
 - **Python**: 3.10+
-- **ML Framework**: PyTorch, Diffusers
-- **Model**: Tongyi-MAI/Z-Image-Turbo (S3-DiT 6B)
+- **ML Framework**: PyTorch (Diffusers) + MLX (MFLUX)
+- **Model**: Tongyi-MAI/Z-Image-Turbo (S3-DiT 6B, ~31GB)
 - **UI**: Gradio 4.x
+
+## Supported Backends
+
+| Backend | Platform | Speed | Notes |
+|---------|----------|-------|-------|
+| MLX | Apple Silicon | Fast | 4-bit quantized, 4 steps ~20s |
+| CUDA | NVIDIA GPU | Fastest | Full precision |
+| MPS | Apple Metal | Slow | ~45s/step, attention slicing |
+| CPU | All | Very Slow | Fallback only |
 
 ## Project Structure
 
 ```
 BarunVision/
-├── app.py              # 메인 Gradio 웹 애플리케이션
+├── app.py              # 메인 통합 앱 (MLX + Diffusers)
 ├── requirements.txt    # Python 의존성
-├── outputs/            # 생성된 이미지 저장
+├── backup/             # 이전 버전 백업
+│   ├── app_mlx.py
+│   └── app_diffusers.py
+├── outputs/            # 생성된 이미지 저장 (git ignored)
+├── .serena/            # 프로젝트 메모리
 └── README.md           # 사용자 가이드
 ```
 
@@ -31,9 +44,16 @@ BarunVision/
 
 ### Device Support
 
-1. **CUDA GPU** - 최적 성능
-2. **Apple MPS** - M1/M2/M3 지원
-3. **CPU** - enable_model_cpu_offload() 사용
+1. **MLX** - Apple Silicon 최적화 (8-bit 양자화)
+2. **CUDA GPU** - 최적 성능
+3. **Apple MPS** - M1/M2/M3 지원 (attention slicing 활성화)
+4. **CPU** - 폴백 옵션
+
+### Key Features
+
+- **Progress Bar**: Diffusers `callback_on_step_end` + Gradio `gr.Progress()` 연동
+- **Cancel Button**: 생성 중 취소 가능 (`pipeline._interrupt`)
+- **State Management**: `_is_generating`, `_cancel_requested` 플래그
 
 ## Development Commands
 
