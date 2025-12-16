@@ -64,6 +64,66 @@ _mlx_lora_configs = None  # MLX 모델에 적용된 LoRA 설정 (재생성 필�
 _loaded_adapters = []  # Diffusers T2I에 로드된 어댑터 이름들
 _loaded_i2i_adapters = []  # Diffusers I2I에 로드된 어댑터 이름들
 
+# 업스케일러
+_upscaler = None
+_upscaler_device = None
+
+
+def get_upscaler():
+    """Real-ESRGAN 업스케일러 로드 (lazy loading, spandrel 사용)."""
+    global _upscaler, _upscaler_device
+
+    if _upscaler is None:
+        import torch
+        from spandrel import ImageModelDescriptor, ModelLoader
+        from huggingface_hub import hf_hub_download
+
+        # 디바이스 선택 (MPS > CUDA > CPU)
+        if torch.backends.mps.is_available():
+            _upscaler_device = torch.device("mps")
+        elif torch.cuda.is_available():
+            _upscaler_device = torch.device("cuda")
+        else:
+            _upscaler_device = torch.device("cpu")
+
+        print(f"🔍 업스케일러 로딩 중... (Real-ESRGAN 4x, {_upscaler_device})")
+
+        # HuggingFace에서 모델 다운로드
+        model_path = hf_hub_download(
+            repo_id="ai-forever/Real-ESRGAN",
+            filename="RealESRGAN_x4.pth",
+        )
+
+        # Spandrel로 모델 로드
+        _upscaler = ModelLoader().load_from_file(model_path)
+        assert isinstance(_upscaler, ImageModelDescriptor)
+        _upscaler.model.to(_upscaler_device).eval()
+        print("✅ 업스케일러 로딩 완료!")
+
+    return _upscaler
+
+
+def upscale_image(image: Image.Image) -> Image.Image:
+    """이미지 업스케일 (Real-ESRGAN 4x)."""
+    import torch
+    import numpy as np
+
+    upscaler = get_upscaler()
+
+    # PIL → Tensor (BCHW, 0-1 범위)
+    img_np = np.array(image.convert("RGB")).astype(np.float32) / 255.0
+    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)
+    img_tensor = img_tensor.to(_upscaler_device)
+
+    # 업스케일 실행
+    with torch.no_grad():
+        output = upscaler.model(img_tensor)
+
+    # Tensor → PIL
+    output = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    output = (output * 255).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(output)
+
 
 def detect_backend() -> str:
     """사용 가능한 최적의 백엔드를 감지."""
@@ -426,31 +486,38 @@ def cancel_generation():
 
 def unload_model():
     """모델 언로드 및 메모리 해제."""
-    global _model, _pipeline, _img2img_pipeline, _is_generating
-    
+    global _model, _pipeline, _img2img_pipeline, _upscaler, _upscaler_device, _is_generating
+
     if _is_generating:
         return "⚠️ 생성 중에는 언로드할 수 없습니다. 먼저 취소해주세요."
-    
+
     unloaded = []
-    
+
     # MLX 모델 해제
     if _model is not None:
         del _model
         _model = None
         unloaded.append("MLX")
-    
+
     # Diffusers T2I 파이프라인 해제
     if _pipeline is not None:
         del _pipeline
         _pipeline = None
         unloaded.append("T2I Pipeline")
-    
+
     # Diffusers I2I 파이프라인 해제
     if _img2img_pipeline is not None:
         del _img2img_pipeline
         _img2img_pipeline = None
         unloaded.append("I2I Pipeline")
-    
+
+    # 업스케일러 해제
+    if _upscaler is not None:
+        del _upscaler
+        _upscaler = None
+        _upscaler_device = None
+        unloaded.append("Upscaler")
+
     if not unloaded:
         return "ℹ️ 언로드할 모델이 없습니다."
     
@@ -483,9 +550,10 @@ def generate_image(
     num_steps: int,
     seed: int,
     save_image: bool,
+    upscale: bool = False,
     progress=gr.Progress(),
 ):
-    """통합 이미지 생성 함수 (Generator 버전 - 버튼 토글, LoRA 지원)."""
+    """통합 이미지 생성 함수 (Generator 버전 - 버튼 토글, LoRA, 업스케일 지원)."""
     global _backend, _is_generating, _cancel_requested
 
     # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
@@ -540,14 +608,25 @@ def generate_image(
             yield None, "⏹️ 생성이 취소되었습니다.", *BTN_GENERATE
             return
 
+        # 업스케일 적용
+        original_size = image.size if image else None
+        if upscale and image is not None:
+            progress(0.9, desc="🔍 업스케일 중...")
+            print("🔍 업스케일 중... (Real-ESRGAN 4x)")
+            image = upscale_image(image)
+            print(f"✅ 업스케일 완료: {original_size} → {image.size}")
+
         # 상태 메시지
         backend_info = get_backend_info(_backend)
         status = f"✅ 생성 완료! ({backend_info['emoji']} {_backend.upper()}, seed: {used_seed}, {gen_time:.1f}초)"
+        if upscale and original_size:
+            status += f"\n🔍 업스케일: {original_size[0]}x{original_size[1]} → {image.size[0]}x{image.size[1]}"
 
         # 이미지 저장
         if save_image and image is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = OUTPUT_DIR / f"zvision_{timestamp}_{used_seed}.png"
+            suffix = "_upscaled" if upscale else ""
+            filename = OUTPUT_DIR / f"zvision_{timestamp}_{used_seed}{suffix}.png"
             image.save(filename)
             status += f"\n💾 저장됨: {filename}"
 
@@ -570,9 +649,10 @@ def generate_image_i2i(
     num_steps: int,
     seed: int,
     save_image: bool,
+    upscale: bool = False,
     progress=gr.Progress(),
 ):
-    """통합 Image-to-Image 생성 함수 (Generator 버전 - 버튼 토글, LoRA 지원)."""
+    """통합 Image-to-Image 생성 함수 (Generator 버전 - 버튼 토글, LoRA, 업스케일 지원)."""
     global _backend, _is_generating, _cancel_requested
 
     # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
@@ -626,14 +706,25 @@ def generate_image_i2i(
             yield None, "⏹️ 생성이 취소되었습니다.", *BTN_GENERATE
             return
 
+        # 업스케일 적용
+        original_size = image.size if image else None
+        if upscale and image is not None:
+            progress(0.9, desc="🔍 업스케일 중...")
+            print("🔍 업스케일 중... (Real-ESRGAN 4x)")
+            image = upscale_image(image)
+            print(f"✅ 업스케일 완료: {original_size} → {image.size}")
+
         # 상태 메시지
         backend_info = get_backend_info(_backend)
         status = f"✅ Img2Img 완료! ({backend_info['emoji']} {_backend.upper()}, strength: {strength}, seed: {used_seed}, {gen_time:.1f}초)"
+        if upscale and original_size:
+            status += f"\n🔍 업스케일: {original_size[0]}x{original_size[1]} → {image.size[0]}x{image.size[1]}"
 
         # 이미지 저장
         if save_image and image is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = OUTPUT_DIR / f"zvision_i2i_{timestamp}_{used_seed}.png"
+            suffix = "_upscaled" if upscale else ""
+            filename = OUTPUT_DIR / f"zvision_i2i_{timestamp}_{used_seed}{suffix}.png"
             image.save(filename)
             status += f"\n💾 저장됨: {filename}"
 
@@ -731,6 +822,12 @@ def create_ui():
                             label="이미지 자동 저장",
                             value=True,
                             info=f"저장 위치: {OUTPUT_DIR.absolute()}",
+                        )
+
+                        upscale_t2i = gr.Checkbox(
+                            label="🔍 4x 업스케일 (Real-ESRGAN)",
+                            value=False,
+                            info="생성 후 4배 확대 (예: 1024→4096)",
                         )
 
                         with gr.Row():
@@ -834,6 +931,12 @@ def create_ui():
                             info=f"저장 위치: {OUTPUT_DIR.absolute()}",
                         )
 
+                        upscale_i2i = gr.Checkbox(
+                            label="🔍 4x 업스케일 (Real-ESRGAN)",
+                            value=False,
+                            info="생성 후 4배 확대 (예: 1024→4096)",
+                        )
+
                         with gr.Row():
                             generate_btn_i2i = gr.Button(
                                 "🖼️ 이미지 변형" if i2i_supported else "🖼️ 이미지 변형 (MLX 미지원)",
@@ -888,13 +991,13 @@ def create_ui():
         # Text-to-Image 이벤트
         generate_btn_t2i.click(
             fn=generate_image,
-            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i],
+            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i, upscale_t2i],
             outputs=[output_image_t2i, status_t2i, generate_btn_t2i, cancel_btn_t2i],
         )
 
         prompt_t2i.submit(
             fn=generate_image,
-            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i],
+            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i, upscale_t2i],
             outputs=[output_image_t2i, status_t2i, generate_btn_t2i, cancel_btn_t2i],
         )
 
@@ -907,7 +1010,7 @@ def create_ui():
         # Image-to-Image 이벤트
         generate_btn_i2i.click(
             fn=generate_image_i2i,
-            inputs=[prompt_i2i, init_image, strength, num_steps_i2i, seed_i2i, save_image_i2i],
+            inputs=[prompt_i2i, init_image, strength, num_steps_i2i, seed_i2i, save_image_i2i, upscale_i2i],
             outputs=[output_image_i2i, status_i2i, generate_btn_i2i, cancel_btn_i2i],
         )
 
