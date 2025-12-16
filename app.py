@@ -292,12 +292,13 @@ def generate_img2img(
 # ============================================================
 
 def cancel_generation():
-    """생성 취소 요청."""
+    """생성 취소 요청. 버튼 상태도 함께 반환."""
     global _cancel_requested, _is_generating
     if _is_generating:
         _cancel_requested = True
-        return "⏹️ 취소 요청됨... 현재 스텝 완료 후 중단됩니다."
-    return "생성 중이 아닙니다."
+        # 취소 요청 시 버튼 상태 복원 (생성 버튼 표시, 취소 버튼 숨김)
+        return "⏹️ 취소 요청됨... 현재 스텝 완료 후 중단됩니다.", gr.update(visible=True), gr.update(visible=False)
+    return "생성 중이 아닙니다.", gr.update(visible=True), gr.update(visible=False)
 
 
 def unload_model():
@@ -356,22 +357,32 @@ def generate_image(
     seed: int,
     save_image: bool,
     progress=gr.Progress(),
-) -> tuple[Image.Image, str]:
-    """통합 이미지 생성 함수."""
+):
+    """통합 이미지 생성 함수 (Generator 버전 - 버튼 토글 지원)."""
     global _backend, _is_generating, _cancel_requested
 
+    # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
+    BTN_GENERATE = (gr.update(visible=True), gr.update(visible=False))
+    BTN_CANCEL = (gr.update(visible=False), gr.update(visible=True))
+
     if not prompt.strip():
-        return None, "❌ 프롬프트를 입력해주세요."
+        yield None, "❌ 프롬프트를 입력해주세요.", *BTN_GENERATE
+        return
 
     if _backend is None:
-        return None, "❌ 사용 가능한 백엔드가 없습니다. PyTorch 또는 MLX를 설치해주세요."
+        yield None, "❌ 사용 가능한 백엔드가 없습니다. PyTorch 또는 MLX를 설치해주세요.", *BTN_GENERATE
+        return
 
     if _is_generating:
-        return None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요."
+        yield None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요.", *BTN_GENERATE
+        return
 
     try:
         _is_generating = True
         _cancel_requested = False
+        
+        # 즉시 버튼 상태 변경 (취소 버튼으로)
+        yield None, "🚀 생성 시작...", *BTN_CANCEL
         
         print(f"🎨 이미지 생성 중... (backend: {_backend})")
         progress(0, desc="생성 시작...")
@@ -391,7 +402,8 @@ def generate_image(
         if _cancel_requested:
             _is_generating = False
             _cancel_requested = False
-            return None, "⏹️ 생성이 취소되었습니다."
+            yield None, "⏹️ 생성이 취소되었습니다.", *BTN_GENERATE
+            return
 
         # 상태 메시지
         backend_info = get_backend_info(_backend)
@@ -405,12 +417,12 @@ def generate_image(
             status += f"\n💾 저장됨: {filename}"
 
         progress(1.0, desc="완료!")
-        return image, status
+        yield image, status, *BTN_GENERATE
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return None, f"❌ 오류 발생: {str(e)}"
+        yield None, f"❌ 오류 발생: {str(e)}", *BTN_GENERATE
     finally:
         _is_generating = False
         _cancel_requested = False
@@ -424,28 +436,40 @@ def generate_image_i2i(
     seed: int,
     save_image: bool,
     progress=gr.Progress(),
-) -> tuple[Image.Image, str]:
-    """통합 Image-to-Image 생성 함수."""
+):
+    """통합 Image-to-Image 생성 함수 (Generator 버전 - 버튼 토글 지원)."""
     global _backend, _is_generating, _cancel_requested
 
+    # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
+    BTN_GENERATE = (gr.update(visible=True), gr.update(visible=False))
+    BTN_CANCEL = (gr.update(visible=False), gr.update(visible=True))
+
     if not prompt.strip():
-        return None, "❌ 프롬프트를 입력해주세요."
+        yield None, "❌ 프롬프트를 입력해주세요.", *BTN_GENERATE
+        return
 
     if init_image is None:
-        return None, "❌ 입력 이미지를 업로드해주세요."
+        yield None, "❌ 입력 이미지를 업로드해주세요.", *BTN_GENERATE
+        return
 
     if _backend is None:
-        return None, "❌ 사용 가능한 백엔드가 없습니다."
+        yield None, "❌ 사용 가능한 백엔드가 없습니다.", *BTN_GENERATE
+        return
 
     if _backend == "mlx":
-        return None, "❌ MLX 백엔드는 Image-to-Image를 지원하지 않습니다. PyTorch 백엔드를 사용해주세요."
+        yield None, "❌ MLX 백엔드는 Image-to-Image를 지원하지 않습니다. PyTorch 백엔드를 사용해주세요.", *BTN_GENERATE
+        return
 
     if _is_generating:
-        return None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요."
+        yield None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요.", *BTN_GENERATE
+        return
 
     try:
         _is_generating = True
         _cancel_requested = False
+
+        # 즉시 버튼 상태 변경 (취소 버튼으로)
+        yield None, "🚀 Img2Img 생성 시작...", *BTN_CANCEL
 
         print(f"🖼️ Image-to-Image 생성 중... (backend: {_backend}, strength: {strength})")
         progress(0, desc="Img2Img 생성 시작...")
@@ -459,7 +483,8 @@ def generate_image_i2i(
         if _cancel_requested:
             _is_generating = False
             _cancel_requested = False
-            return None, "⏹️ 생성이 취소되었습니다."
+            yield None, "⏹️ 생성이 취소되었습니다.", *BTN_GENERATE
+            return
 
         # 상태 메시지
         backend_info = get_backend_info(_backend)
@@ -473,12 +498,12 @@ def generate_image_i2i(
             status += f"\n💾 저장됨: {filename}"
 
         progress(1.0, desc="완료!")
-        return image, status
+        yield image, status, *BTN_GENERATE
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return None, f"❌ 오류 발생: {str(e)}"
+        yield None, f"❌ 오류 발생: {str(e)}", *BTN_GENERATE
     finally:
         _is_generating = False
         _cancel_requested = False
@@ -574,13 +599,13 @@ def create_ui():
                                 variant="primary",
                                 size="lg",
                                 interactive=_backend is not None,
-                                scale=3,
+                                visible=True,
                             )
                             cancel_btn_t2i = gr.Button(
                                 "⏹️ 취소",
                                 variant="stop",
                                 size="lg",
-                                scale=1,
+                                visible=False,
                             )
 
                     with gr.Column(scale=1):
@@ -675,13 +700,13 @@ def create_ui():
                                 variant="primary",
                                 size="lg",
                                 interactive=i2i_supported,
-                                scale=3,
+                                visible=True,
                             )
                             cancel_btn_i2i = gr.Button(
                                 "⏹️ 취소",
                                 variant="stop",
                                 size="lg",
-                                scale=1,
+                                visible=False,
                             )
 
                     with gr.Column(scale=1):
@@ -724,32 +749,32 @@ def create_ui():
         generate_btn_t2i.click(
             fn=generate_image,
             inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i],
-            outputs=[output_image_t2i, status_t2i],
+            outputs=[output_image_t2i, status_t2i, generate_btn_t2i, cancel_btn_t2i],
         )
 
         prompt_t2i.submit(
             fn=generate_image,
             inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i],
-            outputs=[output_image_t2i, status_t2i],
+            outputs=[output_image_t2i, status_t2i, generate_btn_t2i, cancel_btn_t2i],
         )
 
         cancel_btn_t2i.click(
             fn=cancel_generation,
             inputs=[],
-            outputs=[status_t2i],
+            outputs=[status_t2i, generate_btn_t2i, cancel_btn_t2i],
         )
 
         # Image-to-Image 이벤트
         generate_btn_i2i.click(
             fn=generate_image_i2i,
             inputs=[prompt_i2i, init_image, strength, num_steps_i2i, seed_i2i, save_image_i2i],
-            outputs=[output_image_i2i, status_i2i],
+            outputs=[output_image_i2i, status_i2i, generate_btn_i2i, cancel_btn_i2i],
         )
 
         cancel_btn_i2i.click(
             fn=cancel_generation,
             inputs=[],
-            outputs=[status_i2i],
+            outputs=[status_i2i, generate_btn_i2i, cancel_btn_i2i],
         )
 
         # 모델 언로드 이벤트

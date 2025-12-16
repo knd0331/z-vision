@@ -9,6 +9,7 @@
 | 4 | 기본값 최적화 | 2025-12-09 | 512x512, 6 steps |
 | 5 | **Image-to-Image 기능** | 2025-12-16 | `ZImageImg2ImgPipeline` + Tabs UI + MLX 비활성화 |
 | 6 | **메모리 해제 기능** | 2025-12-16 | `unload_model()` + 🗑️ 버튼 + gc.collect() + GPU cache clear |
+| 7 | **버튼 토글 UX** | 2025-12-16 | Generator 패턴 + visibility 토글 (생성↔취소) |
 
 ## 🎉 오픈소스 기여
 - **PR #12815**: Flux2ImageProcessor AttributeError 수정 (리뷰 대기 중)
@@ -17,15 +18,20 @@
 ## ❌ 남은 개선점
 | # | 항목 | 우선순위 | 설명 |
 |---|------|----------|------|
-| 1 | 생성 중 버튼 상태 변경 | 중간 | `gr.update(interactive=False)`로 생성 중 버튼 비활성화 |
-| 2 | 예상 시간(ETA) 표시 | 중간 | 첫 스텝 시간 측정 → 남은 시간 계산 표시 |
-| 3 | MLX Progress Bar | 낮음 | MFLUX 콜백 지원 여부 확인 필요 |
-| 4 | MLX 취소 기능 | 낮음 | MFLUX 중단 메커니즘 확인 필요 |
+| 1 | 예상 시간(ETA) 표시 | 중간 | 첫 스텝 시간 측정 → 남은 시간 계산 표시 |
+| 2 | MLX Progress Bar | 낮음 | MFLUX 콜백 지원 여부 확인 필요 |
+| 3 | MLX 취소 기능 | 낮음 | MFLUX 중단 메커니즘 확인 필요 |
 
 ## 구현 노트
+
+### 버튼 토글 UX (완료)
+- Generator 패턴: `generate_image()` → yield로 즉시 UI 업데이트
+- `gr.update(visible=True/False)`로 버튼 visibility 토글
+- 대기 중: 생성 버튼만 표시
+- 생성 중: 취소 버튼만 표시
+- outputs에 버튼 포함: `[output_image, status, generate_btn, cancel_btn]`
 
 ### 메모리 해제 기능 (완료)
 - `unload_model()` 함수: app.py:302-351
 - MLX 모델, T2I/I2I 파이프라인 모두 해제
 - `gc.collect()` + `torch.cuda.empty_cache()` / `torch.mps.empty_cache()`
-- UI: 탭 아래, 이벤트 핸들러 전에 버튼 배치
