@@ -30,6 +30,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 _backend = None
 _model = None
 _pipeline = None
+_img2img_pipeline = None  # Image-to-Image 파이프라인
 _is_generating = False
 _cancel_requested = False
 
@@ -216,6 +217,77 @@ def generate_diffusers(prompt: str, width: int, height: int, num_steps: int, see
 
 
 # ============================================================
+# Image-to-Image Backend (Diffusers Only)
+# ============================================================
+
+def get_img2img_pipeline(device: str):
+    """Diffusers ZImageImg2ImgPipeline 로드 (lazy loading)."""
+    global _img2img_pipeline
+    if _img2img_pipeline is None:
+        print(f"🚀 Z-Image-Turbo Img2Img 모델 로딩 중 (PyTorch/{device.upper()})...")
+        import torch
+        from diffusers import ZImageImg2ImgPipeline
+
+        _img2img_pipeline = ZImageImg2ImgPipeline.from_pretrained(
+            "Tongyi-MAI/Z-Image-Turbo",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+
+        if device == "cuda":
+            _img2img_pipeline.to("cuda")
+            print("✅ CUDA GPU에서 실행 (Img2Img)")
+        elif device == "mps":
+            _img2img_pipeline.to("mps")
+            _img2img_pipeline.enable_attention_slicing()
+            print("✅ Apple MPS에서 실행 (Img2Img, attention slicing 활성화)")
+        else:
+            _img2img_pipeline.to("cpu")
+            _img2img_pipeline.enable_attention_slicing()
+            print("⚠️ CPU에서 실행 (Img2Img, 느릴 수 있음)")
+
+        print("✅ Img2Img 모델 로딩 완료!")
+
+    return _img2img_pipeline
+
+
+def generate_img2img(
+    prompt: str,
+    init_image: Image.Image,
+    strength: float,
+    num_steps: int,
+    seed: int,
+    device: str,
+    progress_fn=None,
+) -> tuple[Image.Image, float, int]:
+    """PyTorch/Diffusers 백엔드로 Image-to-Image 생성."""
+    import torch
+    pipe = get_img2img_pipeline(device)
+
+    if seed == -1:
+        seed = torch.randint(0, 2**32, (1,)).item()
+
+    generator = torch.Generator(device if device != "cpu" else "cpu").manual_seed(int(seed))
+
+    # 진행률 콜백 생성
+    callback = make_progress_callback(num_steps, progress_fn)
+
+    start_time = time.time()
+    result = pipe(
+        prompt=prompt,
+        image=init_image,
+        strength=strength,
+        num_inference_steps=num_steps,
+        guidance_scale=0.0,  # Turbo 모델은 0.0 필수
+        generator=generator,
+        callback_on_step_end=callback,
+    )
+    gen_time = time.time() - start_time
+
+    return result.images[0], gen_time, seed
+
+
+# ============================================================
 # Unified Generation
 # ============================================================
 
@@ -296,6 +368,74 @@ def generate_image(
         _cancel_requested = False
 
 
+def generate_image_i2i(
+    prompt: str,
+    init_image: Image.Image,
+    strength: float,
+    num_steps: int,
+    seed: int,
+    save_image: bool,
+    progress=gr.Progress(),
+) -> tuple[Image.Image, str]:
+    """통합 Image-to-Image 생성 함수."""
+    global _backend, _is_generating, _cancel_requested
+
+    if not prompt.strip():
+        return None, "❌ 프롬프트를 입력해주세요."
+
+    if init_image is None:
+        return None, "❌ 입력 이미지를 업로드해주세요."
+
+    if _backend is None:
+        return None, "❌ 사용 가능한 백엔드가 없습니다."
+
+    if _backend == "mlx":
+        return None, "❌ MLX 백엔드는 Image-to-Image를 지원하지 않습니다. PyTorch 백엔드를 사용해주세요."
+
+    if _is_generating:
+        return None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요."
+
+    try:
+        _is_generating = True
+        _cancel_requested = False
+
+        print(f"🖼️ Image-to-Image 생성 중... (backend: {_backend}, strength: {strength})")
+        progress(0, desc="Img2Img 생성 시작...")
+
+        image, gen_time, used_seed = generate_img2img(
+            prompt, init_image, strength, num_steps, seed, _backend,
+            progress_fn=progress
+        )
+
+        # 취소 확인
+        if _cancel_requested:
+            _is_generating = False
+            _cancel_requested = False
+            return None, "⏹️ 생성이 취소되었습니다."
+
+        # 상태 메시지
+        backend_info = get_backend_info(_backend)
+        status = f"✅ Img2Img 완료! ({backend_info['emoji']} {_backend.upper()}, strength: {strength}, seed: {used_seed}, {gen_time:.1f}초)"
+
+        # 이미지 저장
+        if save_image and image is not None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = OUTPUT_DIR / f"zvision_i2i_{timestamp}_{used_seed}.png"
+            image.save(filename)
+            status += f"\n💾 저장됨: {filename}"
+
+        progress(1.0, desc="완료!")
+        return image, status
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, f"❌ 오류 발생: {str(e)}"
+    finally:
+        _is_generating = False
+        _cancel_requested = False
+
+
 # ============================================================
 # Gradio UI
 # ============================================================
@@ -305,6 +445,9 @@ def create_ui():
     global _backend
     _backend = detect_backend()
     backend_info = get_backend_info(_backend) if _backend else {"name": "None", "emoji": "❌"}
+
+    # Image-to-Image 지원 여부 (MLX는 미지원)
+    i2i_supported = _backend is not None and _backend != "mlx"
 
     with gr.Blocks() as app:
 
@@ -324,113 +467,221 @@ def create_ui():
             </div>
             """)
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                # 입력 섹션
-                prompt = gr.Textbox(
-                    label="프롬프트",
-                    placeholder="생성하고 싶은 이미지를 설명해주세요...",
-                    lines=4,
-                    max_lines=8,
+        with gr.Tabs():
+            # ============================================================
+            # Tab 1: Text-to-Image
+            # ============================================================
+            with gr.TabItem("🎨 Text-to-Image"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        # 입력 섹션
+                        prompt_t2i = gr.Textbox(
+                            label="프롬프트",
+                            placeholder="생성하고 싶은 이미지를 설명해주세요...",
+                            lines=4,
+                            max_lines=8,
+                        )
+
+                        with gr.Row():
+                            width_t2i = gr.Slider(
+                                label="너비",
+                                minimum=512,
+                                maximum=backend_info.get("max_size", 1536) if _backend else 1024,
+                                value=backend_info.get("default_size", 512) if _backend else 512,
+                                step=64,
+                            )
+                            height_t2i = gr.Slider(
+                                label="높이",
+                                minimum=512,
+                                maximum=backend_info.get("max_size", 1536) if _backend else 1024,
+                                value=backend_info.get("default_size", 512) if _backend else 512,
+                                step=64,
+                            )
+
+                        with gr.Row():
+                            num_steps_t2i = gr.Slider(
+                                label="스텝 수",
+                                minimum=2,
+                                maximum=10,
+                                value=backend_info.get("default_steps", 4) if _backend else 4,
+                                step=1,
+                                info=backend_info.get("step_info", "") if _backend else "",
+                            )
+                            seed_t2i = gr.Number(
+                                label="시드",
+                                value=-1,
+                                precision=0,
+                                info="-1 = 랜덤",
+                            )
+
+                        save_image_t2i = gr.Checkbox(
+                            label="이미지 자동 저장",
+                            value=True,
+                            info=f"저장 위치: {OUTPUT_DIR.absolute()}",
+                        )
+
+                        with gr.Row():
+                            generate_btn_t2i = gr.Button(
+                                "🎨 이미지 생성",
+                                variant="primary",
+                                size="lg",
+                                interactive=_backend is not None,
+                                scale=3,
+                            )
+                            cancel_btn_t2i = gr.Button(
+                                "⏹️ 취소",
+                                variant="stop",
+                                size="lg",
+                                scale=1,
+                            )
+
+                    with gr.Column(scale=1):
+                        # 출력 섹션
+                        output_image_t2i = gr.Image(
+                            label="생성된 이미지",
+                            type="pil",
+                            height=512,
+                        )
+                        status_t2i = gr.Textbox(
+                            label="상태",
+                            interactive=False,
+                        )
+
+                # 예제
+                gr.Examples(
+                    examples=[
+                        ["A majestic mountain landscape at sunset with snow-capped peaks and a crystal clear lake reflection"],
+                        ["귀여운 하얀 고양이가 창가에서 낮잠을 자고 있는 모습, 따뜻한 햇살"],
+                        ["Cyberpunk city street at night, neon lights, rain reflections, cinematic atmosphere"],
+                        ["한복을 입은 여성이 벚꽃 나무 아래 서 있는 동양화 스타일"],
+                        ["Delicious Korean bibimbap in a stone pot, food photography, top view"],
+                    ],
+                    inputs=[prompt_t2i],
+                    label="예제 프롬프트",
                 )
+
+            # ============================================================
+            # Tab 2: Image-to-Image
+            # ============================================================
+            with gr.TabItem("🖼️ Image-to-Image"):
+                # MLX 경고 메시지
+                if _backend == "mlx":
+                    gr.HTML("""
+                    <div class="warning-box">
+                        <p>⚠️ MLX 백엔드는 Image-to-Image를 지원하지 않습니다.</p>
+                        <p>PyTorch 백엔드 (CUDA/MPS/CPU)를 사용해주세요.</p>
+                    </div>
+                    """)
 
                 with gr.Row():
-                    width = gr.Slider(
-                        label="너비",
-                        minimum=512,
-                        maximum=backend_info.get("max_size", 1536) if _backend else 1024,
-                        value=backend_info.get("default_size", 512) if _backend else 512,
-                        step=64,
-                    )
-                    height = gr.Slider(
-                        label="높이",
-                        minimum=512,
-                        maximum=backend_info.get("max_size", 1536) if _backend else 1024,
-                        value=backend_info.get("default_size", 512) if _backend else 512,
-                        step=64,
-                    )
+                    with gr.Column(scale=1):
+                        # 입력 이미지
+                        init_image = gr.Image(
+                            label="입력 이미지",
+                            type="pil",
+                            height=256,
+                        )
 
-                with gr.Row():
-                    num_steps = gr.Slider(
-                        label="스텝 수",
-                        minimum=2,
-                        maximum=10,
-                        value=backend_info.get("default_steps", 4) if _backend else 4,
-                        step=1,
-                        info=backend_info.get("step_info", "") if _backend else "",
-                    )
-                    seed = gr.Number(
-                        label="시드",
-                        value=-1,
-                        precision=0,
-                        info="-1 = 랜덤",
-                    )
+                        # 프롬프트
+                        prompt_i2i = gr.Textbox(
+                            label="프롬프트",
+                            placeholder="이미지를 어떻게 변형할지 설명해주세요...",
+                            lines=3,
+                            max_lines=6,
+                        )
 
-                save_image = gr.Checkbox(
-                    label="이미지 자동 저장",
-                    value=True,
-                    info=f"저장 위치: {OUTPUT_DIR.absolute()}",
-                )
+                        # Strength 슬라이더
+                        strength = gr.Slider(
+                            label="변형 강도 (Strength)",
+                            minimum=0.1,
+                            maximum=1.0,
+                            value=0.6,
+                            step=0.05,
+                            info="0.1 = 원본 유지, 1.0 = 완전 변형",
+                        )
 
-                with gr.Row():
-                    generate_btn = gr.Button(
-                        "🎨 이미지 생성",
-                        variant="primary",
-                        size="lg",
-                        interactive=_backend is not None,
-                        scale=3,
-                    )
-                    cancel_btn = gr.Button(
-                        "⏹️ 취소",
-                        variant="stop",
-                        size="lg",
-                        scale=1,
-                    )
+                        with gr.Row():
+                            num_steps_i2i = gr.Slider(
+                                label="스텝 수",
+                                minimum=2,
+                                maximum=10,
+                                value=backend_info.get("default_steps", 6) if _backend else 6,
+                                step=1,
+                            )
+                            seed_i2i = gr.Number(
+                                label="시드",
+                                value=-1,
+                                precision=0,
+                                info="-1 = 랜덤",
+                            )
 
-            with gr.Column(scale=1):
-                # 출력 섹션
-                output_image = gr.Image(
-                    label="생성된 이미지",
-                    type="pil",
-                    height=512,
-                )
-                status = gr.Textbox(
-                    label="상태",
-                    interactive=False,
-                )
+                        save_image_i2i = gr.Checkbox(
+                            label="이미지 자동 저장",
+                            value=True,
+                            info=f"저장 위치: {OUTPUT_DIR.absolute()}",
+                        )
 
-        # 예제
-        gr.Examples(
-            examples=[
-                ["A majestic mountain landscape at sunset with snow-capped peaks and a crystal clear lake reflection"],
-                ["귀여운 하얀 고양이가 창가에서 낮잠을 자고 있는 모습, 따뜻한 햇살"],
-                ["Cyberpunk city street at night, neon lights, rain reflections, cinematic atmosphere"],
-                ["한복을 입은 여성이 벚꽃 나무 아래 서 있는 동양화 스타일"],
-                ["Delicious Korean bibimbap in a stone pot, food photography, top view"],
-            ],
-            inputs=[prompt],
-            label="예제 프롬프트",
-        )
+                        with gr.Row():
+                            generate_btn_i2i = gr.Button(
+                                "🖼️ 이미지 변형" if i2i_supported else "🖼️ 이미지 변형 (MLX 미지원)",
+                                variant="primary",
+                                size="lg",
+                                interactive=i2i_supported,
+                                scale=3,
+                            )
+                            cancel_btn_i2i = gr.Button(
+                                "⏹️ 취소",
+                                variant="stop",
+                                size="lg",
+                                scale=1,
+                            )
 
+                    with gr.Column(scale=1):
+                        # 출력 섹션
+                        output_image_i2i = gr.Image(
+                            label="변형된 이미지",
+                            type="pil",
+                            height=512,
+                        )
+                        status_i2i = gr.Textbox(
+                            label="상태",
+                            interactive=False,
+                        )
+
+        # ============================================================
         # 이벤트 연결
-        generate_btn.click(
+        # ============================================================
+
+        # Text-to-Image 이벤트
+        generate_btn_t2i.click(
             fn=generate_image,
-            inputs=[prompt, width, height, num_steps, seed, save_image],
-            outputs=[output_image, status],
+            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i],
+            outputs=[output_image_t2i, status_t2i],
         )
 
-        # Enter 키로 생성
-        prompt.submit(
+        prompt_t2i.submit(
             fn=generate_image,
-            inputs=[prompt, width, height, num_steps, seed, save_image],
-            outputs=[output_image, status],
+            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i],
+            outputs=[output_image_t2i, status_t2i],
         )
 
-        # 취소 버튼
-        cancel_btn.click(
+        cancel_btn_t2i.click(
             fn=cancel_generation,
             inputs=[],
-            outputs=[status],
+            outputs=[status_t2i],
+        )
+
+        # Image-to-Image 이벤트
+        generate_btn_i2i.click(
+            fn=generate_image_i2i,
+            inputs=[prompt_i2i, init_image, strength, num_steps_i2i, seed_i2i, save_image_i2i],
+            outputs=[output_image_i2i, status_i2i],
+        )
+
+        cancel_btn_i2i.click(
+            fn=cancel_generation,
+            inputs=[],
+            outputs=[status_i2i],
         )
 
         gr.HTML("""
@@ -467,6 +718,8 @@ if __name__ == "__main__":
         .title .backend-info { font-size: 0.9em; color: #666; margin-top: 0.5rem; }
         .footer { text-align: center; margin-top: 1rem; opacity: 0.7; }
         .error-box { background: #fee; border: 1px solid #fcc; padding: 1rem; border-radius: 8px; margin: 1rem 0; text-align: center; }
+        .warning-box { background: #fff3cd !important; border: 1px solid #ffc107 !important; padding: 1rem; border-radius: 8px; margin: 1rem 0; text-align: center; color: #856404 !important; }
+        .warning-box p { color: #856404 !important; }
         """,
         head="<title>Z-Vision</title>",
     )
