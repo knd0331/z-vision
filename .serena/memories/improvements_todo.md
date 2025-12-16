@@ -10,6 +10,8 @@
 | 5 | **Image-to-Image 기능** | 2025-12-16 | `ZImageImg2ImgPipeline` + Tabs UI + MLX 비활성화 |
 | 6 | **메모리 해제 기능** | 2025-12-16 | `unload_model()` + 🗑️ 버튼 + gc.collect() + GPU cache clear |
 | 7 | **버튼 토글 UX** | 2025-12-16 | Generator 패턴 + visibility 토글 (생성↔취소) |
+| 8 | **Multi-LoRA 지원** | 2025-12-16 | MLX/Diffusers 모두 다중 LoRA 적용 지원 |
+| 9 | **Real-ESRGAN 업스케일** | 2025-12-16 | py-real-esrgan 4x 업스케일 (1024→4096) |
 
 ## 🎉 오픈소스 기여
 - **PR #12815**: Flux2ImageProcessor AttributeError 수정 (리뷰 대기 중)
