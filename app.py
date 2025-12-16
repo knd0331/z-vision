@@ -300,6 +300,54 @@ def cancel_generation():
     return "생성 중이 아닙니다."
 
 
+def unload_model():
+    """모델 언로드 및 메모리 해제."""
+    global _model, _pipeline, _img2img_pipeline, _is_generating
+    
+    if _is_generating:
+        return "⚠️ 생성 중에는 언로드할 수 없습니다. 먼저 취소해주세요."
+    
+    unloaded = []
+    
+    # MLX 모델 해제
+    if _model is not None:
+        del _model
+        _model = None
+        unloaded.append("MLX")
+    
+    # Diffusers T2I 파이프라인 해제
+    if _pipeline is not None:
+        del _pipeline
+        _pipeline = None
+        unloaded.append("T2I Pipeline")
+    
+    # Diffusers I2I 파이프라인 해제
+    if _img2img_pipeline is not None:
+        del _img2img_pipeline
+        _img2img_pipeline = None
+        unloaded.append("I2I Pipeline")
+    
+    if not unloaded:
+        return "ℹ️ 언로드할 모델이 없습니다."
+    
+    # 가비지 컬렉션
+    import gc
+    gc.collect()
+    
+    # GPU 메모리 캐시 정리
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except ImportError:
+        pass
+    
+    return f"✅ 모델 언로드 완료: {', '.join(unloaded)}\n💾 메모리가 해제되었습니다."
+
+
 def generate_image(
     prompt: str,
     width: int,
@@ -649,6 +697,26 @@ def create_ui():
                         )
 
         # ============================================================
+        # 유틸리티 섹션 (모델 언로드)
+        # ============================================================
+        gr.HTML("<hr style='margin: 1.5rem 0; opacity: 0.3;'>")
+        
+        with gr.Row():
+            with gr.Column(scale=1):
+                unload_btn = gr.Button(
+                    "🗑️ 모델 언로드",
+                    variant="secondary",
+                    size="sm",
+                )
+            with gr.Column(scale=3):
+                unload_status = gr.Textbox(
+                    label="",
+                    placeholder="모델 언로드 시 메모리가 해제됩니다. 다음 생성 시 모델이 다시 로드됩니다.",
+                    interactive=False,
+                    show_label=False,
+                )
+
+        # ============================================================
         # 이벤트 연결
         # ============================================================
 
@@ -682,6 +750,13 @@ def create_ui():
             fn=cancel_generation,
             inputs=[],
             outputs=[status_i2i],
+        )
+
+        # 모델 언로드 이벤트
+        unload_btn.click(
+            fn=unload_model,
+            inputs=[],
+            outputs=[unload_status],
         )
 
         gr.HTML("""
