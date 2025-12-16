@@ -26,6 +26,31 @@ from PIL import Image
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# LoRA 설정
+LORA_DIR = Path("loras")
+LORA_DIR.mkdir(exist_ok=True)
+
+# 다중 LoRA 설정: [(파일명, 강도), ...]
+# 예: [("zy_CinematicShot_zit", 1.0), ("anime_style", 0.5)]
+# 빈 리스트 = LoRA 미사용
+LORA_CONFIG = [
+    ("zy_CinematicShot_zit", 1.0),
+    # ("another_lora", 0.5),  # 주석 해제하여 추가
+]
+
+
+def get_configured_loras() -> list[tuple[str, float]]:
+    """설정된 LoRA 목록 반환. [(경로, 강도), ...] 형태."""
+    result = []
+    for name, scale in LORA_CONFIG:
+        path = LORA_DIR / f"{name}.safetensors"
+        if path.exists():
+            result.append((str(path), scale))
+        else:
+            print(f"⚠️ LoRA 파일 없음: {path}")
+    return result
+
+
 # 전역 변수
 _backend = None
 _model = None
@@ -33,6 +58,11 @@ _pipeline = None
 _img2img_pipeline = None  # Image-to-Image 파이프라인
 _is_generating = False
 _cancel_requested = False
+
+# LoRA 상태 추적
+_mlx_lora_configs = None  # MLX 모델에 적용된 LoRA 설정 (재생성 필요 확인용)
+_loaded_adapters = []  # Diffusers T2I에 로드된 어댑터 이름들
+_loaded_i2i_adapters = []  # Diffusers I2I에 로드된 어댑터 이름들
 
 
 def detect_backend() -> str:
@@ -105,21 +135,52 @@ def get_backend_info(backend: str) -> dict:
 # MLX Backend
 # ============================================================
 
-def get_mlx_model():
-    """MFLUX ZImageTurbo 모델 로드 (lazy loading)."""
-    global _model
+def get_mlx_model(lora_configs: list[tuple[str, float]] | None = None):
+    """MFLUX ZImageTurbo 모델 로드 (lazy loading, 다중 LoRA 지원)."""
+    global _model, _mlx_lora_configs
+
+    # LoRA 설정 변경 시 모델 재생성 필요
+    if _model is not None and _mlx_lora_configs != lora_configs:
+        old_names = [Path(p).name for p, _ in (_mlx_lora_configs or [])]
+        new_names = [Path(p).name for p, _ in (lora_configs or [])]
+        print(f"🔄 LoRA 변경 감지: {old_names} → {new_names}")
+        del _model
+        _model = None
+        _mlx_lora_configs = None
+        import gc
+        gc.collect()
+
     if _model is None:
-        print("🚀 Z-Image-Turbo 모델 로딩 중 (MLX)...")
         from mflux.models.z_image.variants.turbo.z_image_turbo import ZImageTurbo
-        _model = ZImageTurbo(quantize=8)
-        print("✅ 모델 로딩 완료! (MLX + 8-bit 양자화)")
+
+        if lora_configs:
+            lora_paths = [path for path, _ in lora_configs]
+            lora_scales = [scale for _, scale in lora_configs]
+            lora_names = [Path(p).name for p in lora_paths]
+            print(f"🚀 Z-Image-Turbo 모델 로딩 중 (MLX + LoRA: {lora_names})...")
+            _model = ZImageTurbo(
+                quantize=8,
+                lora_paths=lora_paths,
+                lora_scales=lora_scales,
+            )
+            _mlx_lora_configs = lora_configs
+            print(f"✅ 모델 로딩 완료! (MLX + 8-bit 양자화 + {len(lora_configs)} LoRA)")
+        else:
+            print("🚀 Z-Image-Turbo 모델 로딩 중 (MLX)...")
+            _model = ZImageTurbo(quantize=8)
+            _mlx_lora_configs = None
+            print("✅ 모델 로딩 완료! (MLX + 8-bit 양자화)")
+
     return _model
 
 
-def generate_mlx(prompt: str, width: int, height: int, num_steps: int, seed: int) -> tuple[Image.Image, float]:
-    """MLX 백엔드로 이미지 생성."""
+def generate_mlx(
+    prompt: str, width: int, height: int, num_steps: int, seed: int,
+    lora_configs: list[tuple[str, float]] | None = None,
+) -> tuple[Image.Image, float]:
+    """MLX 백엔드로 이미지 생성 (다중 LoRA 지원)."""
     import random
-    model = get_mlx_model()
+    model = get_mlx_model(lora_configs)
 
     if seed == -1:
         seed = random.randint(0, 2**32 - 1)
@@ -188,10 +249,42 @@ def make_progress_callback(num_steps: int, progress_fn=None):
     return callback
 
 
-def generate_diffusers(prompt: str, width: int, height: int, num_steps: int, seed: int, device: str, progress_fn=None) -> tuple[Image.Image, float]:
-    """PyTorch/Diffusers 백엔드로 이미지 생성."""
+def generate_diffusers(
+    prompt: str, width: int, height: int, num_steps: int, seed: int, device: str,
+    progress_fn=None, lora_configs: list[tuple[str, float]] | None = None,
+) -> tuple[Image.Image, float]:
+    """PyTorch/Diffusers 백엔드로 이미지 생성 (다중 LoRA 지원)."""
+    global _loaded_adapters
     import torch
     pipe = get_diffusers_pipeline(device)
+
+    # 현재 요청된 어댑터 이름과 가중치 계산
+    requested_adapters = []
+    adapter_weights = []
+    if lora_configs:
+        for path, scale in lora_configs:
+            adapter_name = Path(path).stem  # 파일명 (확장자 제외)
+            requested_adapters.append(adapter_name)
+            adapter_weights.append(scale)
+
+    # 새로운 LoRA 로드 (아직 로드되지 않은 것만)
+    for path, scale in (lora_configs or []):
+        adapter_name = Path(path).stem
+        if adapter_name not in _loaded_adapters:
+            print(f"🎨 LoRA 로딩: {adapter_name}")
+            try:
+                pipe.load_lora_weights(path, adapter_name=adapter_name)
+                _loaded_adapters.append(adapter_name)
+            except Exception as e:
+                print(f"⚠️ LoRA 로드 실패: {adapter_name} - {e}")
+
+    # 어댑터 설정 (활성화)
+    if requested_adapters:
+        print(f"🎨 LoRA 적용: {list(zip(requested_adapters, adapter_weights))}")
+        pipe.set_adapters(requested_adapters, adapter_weights=adapter_weights)
+    elif _loaded_adapters:
+        # LoRA 설정이 비어있으면 모든 어댑터 비활성화
+        pipe.set_adapters([])
 
     if seed == -1:
         seed = torch.randint(0, 2**32, (1,)).item()
@@ -259,10 +352,40 @@ def generate_img2img(
     seed: int,
     device: str,
     progress_fn=None,
+    lora_configs: list[tuple[str, float]] | None = None,
 ) -> tuple[Image.Image, float, int]:
-    """PyTorch/Diffusers 백엔드로 Image-to-Image 생성."""
+    """PyTorch/Diffusers 백엔드로 Image-to-Image 생성 (다중 LoRA 지원)."""
+    global _loaded_i2i_adapters
     import torch
     pipe = get_img2img_pipeline(device)
+
+    # 현재 요청된 어댑터 이름과 가중치 계산
+    requested_adapters = []
+    adapter_weights = []
+    if lora_configs:
+        for path, scale in lora_configs:
+            adapter_name = Path(path).stem  # 파일명 (확장자 제외)
+            requested_adapters.append(adapter_name)
+            adapter_weights.append(scale)
+
+    # 새로운 LoRA 로드 (아직 로드되지 않은 것만)
+    for path, scale in (lora_configs or []):
+        adapter_name = Path(path).stem
+        if adapter_name not in _loaded_i2i_adapters:
+            print(f"🎨 LoRA 로딩 (I2I): {adapter_name}")
+            try:
+                pipe.load_lora_weights(path, adapter_name=adapter_name)
+                _loaded_i2i_adapters.append(adapter_name)
+            except Exception as e:
+                print(f"⚠️ LoRA 로드 실패 (I2I): {adapter_name} - {e}")
+
+    # 어댑터 설정 (활성화)
+    if requested_adapters:
+        print(f"🎨 LoRA 적용 (I2I): {list(zip(requested_adapters, adapter_weights))}")
+        pipe.set_adapters(requested_adapters, adapter_weights=adapter_weights)
+    elif _loaded_i2i_adapters:
+        # LoRA 설정이 비어있으면 모든 어댑터 비활성화
+        pipe.set_adapters([])
 
     if seed == -1:
         seed = torch.randint(0, 2**32, (1,)).item()
@@ -349,6 +472,10 @@ def unload_model():
     return f"✅ 모델 언로드 완료: {', '.join(unloaded)}\n💾 메모리가 해제되었습니다."
 
 
+# ============================================================
+# Unified Generation
+# ============================================================
+
 def generate_image(
     prompt: str,
     width: int,
@@ -358,7 +485,7 @@ def generate_image(
     save_image: bool,
     progress=gr.Progress(),
 ):
-    """통합 이미지 생성 함수 (Generator 버전 - 버튼 토글 지원)."""
+    """통합 이미지 생성 함수 (Generator 버전 - 버튼 토글, LoRA 지원)."""
     global _backend, _is_generating, _cancel_requested
 
     # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
@@ -377,25 +504,33 @@ def generate_image(
         yield None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요.", *BTN_GENERATE
         return
 
+    # 전역 LoRA 설정 사용
+    lora_configs = get_configured_loras()
+    lora_names = [Path(p).stem for p, _ in lora_configs] if lora_configs else []
+
     try:
         _is_generating = True
         _cancel_requested = False
-        
+
         # 즉시 버튼 상태 변경 (취소 버튼으로)
-        yield None, "🚀 생성 시작...", *BTN_CANCEL
-        
-        print(f"🎨 이미지 생성 중... (backend: {_backend})")
+        lora_info = f" + LoRA: {lora_names}" if lora_configs else ""
+        yield None, f"🚀 생성 시작...{lora_info}", *BTN_CANCEL
+
+        print(f"🎨 이미지 생성 중... (backend: {_backend}{lora_info})")
         progress(0, desc="생성 시작...")
 
         if _backend == "mlx":
             # MLX는 콜백 미지원, 단순 진행률 표시
             progress(0.1, desc="MLX 생성 중... (진행률 표시 미지원)")
-            image, gen_time, used_seed = generate_mlx(prompt, width, height, num_steps, seed)
+            image, gen_time, used_seed = generate_mlx(
+                prompt, width, height, num_steps, seed,
+                lora_configs=lora_configs,
+            )
         else:
             # Diffusers는 콜백으로 진행률 표시
             image, gen_time, used_seed = generate_diffusers(
                 prompt, width, height, num_steps, seed, _backend,
-                progress_fn=progress
+                progress_fn=progress, lora_configs=lora_configs,
             )
 
         # 취소 확인
@@ -437,7 +572,7 @@ def generate_image_i2i(
     save_image: bool,
     progress=gr.Progress(),
 ):
-    """통합 Image-to-Image 생성 함수 (Generator 버전 - 버튼 토글 지원)."""
+    """통합 Image-to-Image 생성 함수 (Generator 버전 - 버튼 토글, LoRA 지원)."""
     global _backend, _is_generating, _cancel_requested
 
     # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
@@ -464,19 +599,24 @@ def generate_image_i2i(
         yield None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요.", *BTN_GENERATE
         return
 
+    # 전역 LoRA 설정 사용
+    lora_configs = get_configured_loras()
+    lora_names = [Path(p).stem for p, _ in lora_configs] if lora_configs else []
+
     try:
         _is_generating = True
         _cancel_requested = False
 
         # 즉시 버튼 상태 변경 (취소 버튼으로)
-        yield None, "🚀 Img2Img 생성 시작...", *BTN_CANCEL
+        lora_info = f" + LoRA: {lora_names}" if lora_configs else ""
+        yield None, f"🚀 Img2Img 생성 시작...{lora_info}", *BTN_CANCEL
 
-        print(f"🖼️ Image-to-Image 생성 중... (backend: {_backend}, strength: {strength})")
+        print(f"🖼️ Image-to-Image 생성 중... (backend: {_backend}, strength: {strength}{lora_info})")
         progress(0, desc="Img2Img 생성 시작...")
 
         image, gen_time, used_seed = generate_img2img(
             prompt, init_image, strength, num_steps, seed, _backend,
-            progress_fn=progress
+            progress_fn=progress, lora_configs=lora_configs,
         )
 
         # 취소 확인

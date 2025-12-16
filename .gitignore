@@ -31,3 +31,4 @@ backup/
 # Cache
 .cache/
 *.cache
+loras/
