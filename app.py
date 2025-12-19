@@ -40,7 +40,7 @@ LORA_CONFIG = [
 
 
 def get_configured_loras() -> list[tuple[str, float]]:
-    """설정된 LoRA 목록 반환. [(경로, 강도), ...] 형태."""
+    """설정된 LoRA 목록 반환. [(경로, 강도), ...] 형태. (하위 호환용)"""
     result = []
     for name, scale in LORA_CONFIG:
         path = LORA_DIR / f"{name}.safetensors"
@@ -48,6 +48,27 @@ def get_configured_loras() -> list[tuple[str, float]]:
             result.append((str(path), scale))
         else:
             print(f"⚠️ LoRA 파일 없음: {path}")
+    return result
+
+
+def scan_loras() -> list[str]:
+    """loras/ 폴더에서 사용 가능한 LoRA 파일 목록 반환."""
+    lora_files = list(LORA_DIR.glob("*.safetensors"))
+    return [f.stem for f in sorted(lora_files)]
+
+
+def build_lora_configs(
+    lora1: str, scale1: float,
+    lora2: str, scale2: float,
+    lora3: str, scale3: float,
+) -> list[tuple[str, float]]:
+    """UI 선택에서 LoRA 설정 리스트 생성."""
+    result = []
+    for name, scale in [(lora1, scale1), (lora2, scale2), (lora3, scale3)]:
+        if name and name != "없음":
+            path = LORA_DIR / f"{name}.safetensors"
+            if path.exists():
+                result.append((str(path), scale))
     return result
 
 
@@ -292,13 +313,42 @@ def get_diffusers_pipeline(device: str):
 
 
 def make_progress_callback(num_steps: int, progress_fn=None):
-    """Diffusers용 진행률 콜백 생성."""
+    """Diffusers용 진행률 콜백 생성 (ETA 표시 포함)."""
+    step_times = []  # 각 스텝별 소요 시간 기록
+    last_step_time = [None]  # 리스트로 감싸서 클로저에서 수정 가능하게
+    
     def callback(pipeline, step, timestep, callback_kwargs):
         global _cancel_requested
+        import time
         
-        # 진행률 업데이트
+        current_time = time.time()
+        
+        # 스텝 시간 기록
+        if last_step_time[0] is not None:
+            step_duration = current_time - last_step_time[0]
+            step_times.append(step_duration)
+        last_step_time[0] = current_time
+        
+        # 진행률 및 ETA 계산
         if progress_fn is not None:
-            progress_fn((step + 1) / num_steps, desc=f"Step {step + 1}/{num_steps}")
+            progress = (step + 1) / num_steps
+            remaining_steps = num_steps - (step + 1)
+            
+            if step_times and remaining_steps > 0:
+                # 평균 스텝 시간으로 ETA 계산
+                avg_step_time = sum(step_times) / len(step_times)
+                eta_seconds = remaining_steps * avg_step_time
+                
+                if eta_seconds < 60:
+                    eta_str = f"~{eta_seconds:.0f}초"
+                else:
+                    eta_str = f"~{eta_seconds/60:.1f}분"
+                
+                desc = f"Step {step + 1}/{num_steps} (남은 시간: {eta_str})"
+            else:
+                desc = f"Step {step + 1}/{num_steps}"
+            
+            progress_fn(progress, desc=desc)
         
         # 취소 요청 확인
         if _cancel_requested:
@@ -474,6 +524,42 @@ def generate_img2img(
 # Unified Generation
 # ============================================================
 
+
+def is_oom_error(error: Exception) -> bool:
+    """GPU 메모리 부족 에러인지 확인."""
+    error_str = str(error).lower()
+    # CUDA OOM
+    if "cuda" in error_str and "out of memory" in error_str:
+        return True
+    # MPS OOM
+    if "mps" in error_str and ("out of memory" in error_str or "memory" in error_str):
+        return True
+    # 일반적인 메모리 에러
+    if "out of memory" in error_str or "oom" in error_str:
+        return True
+    # torch 메모리 할당 실패
+    if "cannot allocate" in error_str or "allocation" in error_str:
+        return True
+    return False
+
+
+def get_oom_message(backend: str) -> str:
+    """OOM 에러 시 사용자 친화적 메시지 반환."""
+    base_msg = "❌ GPU 메모리가 부족합니다.\n\n"
+    suggestions = [
+        "💡 해결 방법:",
+        "  1. 이미지 해상도를 낮춰보세요 (512x512 권장)",
+        "  2. 🗑️ 모델 언로드 버튼을 클릭하여 메모리를 해제하세요",
+        "  3. 다른 앱을 종료하여 GPU 메모리를 확보하세요",
+    ]
+    if backend == "cuda":
+        suggestions.append("  4. nvidia-smi로 GPU 메모리 사용량을 확인하세요")
+    elif backend == "mps":
+        suggestions.append("  4. Activity Monitor에서 GPU 메모리를 확인하세요")
+    
+    return base_msg + "\n".join(suggestions)
+
+
 def cancel_generation():
     """생성 취소 요청. 버튼 상태도 함께 반환."""
     global _cancel_requested, _is_generating
@@ -550,10 +636,16 @@ def generate_image(
     num_steps: int,
     seed: int,
     save_image: bool,
-    upscale: bool = False,
+    upscale: bool,
+    lora1: str,
+    lora1_scale: float,
+    lora2: str,
+    lora2_scale: float,
+    lora3: str,
+    lora3_scale: float,
     progress=gr.Progress(),
 ):
-    """통합 이미지 생성 함수 (Generator 버전 - 버튼 토글, LoRA, 업스케일 지원)."""
+    """통합 이미지 생성 함수 (Generator 버전 - 버튼 토글, LoRA UI, 업스케일 지원)."""
     global _backend, _is_generating, _cancel_requested
 
     # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
@@ -572,8 +664,8 @@ def generate_image(
         yield None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요.", *BTN_GENERATE
         return
 
-    # 전역 LoRA 설정 사용
-    lora_configs = get_configured_loras()
+    # UI에서 선택한 LoRA 설정 사용
+    lora_configs = build_lora_configs(lora1, lora1_scale, lora2, lora2_scale, lora3, lora3_scale)
     lora_names = [Path(p).stem for p, _ in lora_configs] if lora_configs else []
 
     try:
@@ -619,6 +711,8 @@ def generate_image(
         # 상태 메시지
         backend_info = get_backend_info(_backend)
         status = f"✅ 생성 완료! ({backend_info['emoji']} {_backend.upper()}, seed: {used_seed}, {gen_time:.1f}초)"
+        if lora_names:
+            status += f"\n🎨 LoRA: {', '.join(lora_names)}"
         if upscale and original_size:
             status += f"\n🔍 업스케일: {original_size[0]}x{original_size[1]} → {image.size[0]}x{image.size[1]}"
 
@@ -636,7 +730,10 @@ def generate_image(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield None, f"❌ 오류 발생: {str(e)}", *BTN_GENERATE
+        if is_oom_error(e):
+            yield None, get_oom_message(_backend), *BTN_GENERATE
+        else:
+            yield None, f"❌ 오류 발생: {str(e)}", *BTN_GENERATE
     finally:
         _is_generating = False
         _cancel_requested = False
@@ -649,10 +746,16 @@ def generate_image_i2i(
     num_steps: int,
     seed: int,
     save_image: bool,
-    upscale: bool = False,
+    upscale: bool,
+    lora1: str,
+    lora1_scale: float,
+    lora2: str,
+    lora2_scale: float,
+    lora3: str,
+    lora3_scale: float,
     progress=gr.Progress(),
 ):
-    """통합 Image-to-Image 생성 함수 (Generator 버전 - 버튼 토글, LoRA, 업스케일 지원)."""
+    """통합 Image-to-Image 생성 함수 (Generator 버전 - 버튼 토글, LoRA UI, 업스케일 지원)."""
     global _backend, _is_generating, _cancel_requested
 
     # 버튼 상태: (생성 버튼 visible, 취소 버튼 visible)
@@ -679,8 +782,8 @@ def generate_image_i2i(
         yield None, "⚠️ 이미 생성 중입니다. 완료될 때까지 기다리거나 취소해주세요.", *BTN_GENERATE
         return
 
-    # 전역 LoRA 설정 사용
-    lora_configs = get_configured_loras()
+    # UI에서 선택한 LoRA 설정 사용
+    lora_configs = build_lora_configs(lora1, lora1_scale, lora2, lora2_scale, lora3, lora3_scale)
     lora_names = [Path(p).stem for p, _ in lora_configs] if lora_configs else []
 
     try:
@@ -717,6 +820,8 @@ def generate_image_i2i(
         # 상태 메시지
         backend_info = get_backend_info(_backend)
         status = f"✅ Img2Img 완료! ({backend_info['emoji']} {_backend.upper()}, strength: {strength}, seed: {used_seed}, {gen_time:.1f}초)"
+        if lora_names:
+            status += f"\n🎨 LoRA: {', '.join(lora_names)}"
         if upscale and original_size:
             status += f"\n🔍 업스케일: {original_size[0]}x{original_size[1]} → {image.size[0]}x{image.size[1]}"
 
@@ -734,7 +839,10 @@ def generate_image_i2i(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield None, f"❌ 오류 발생: {str(e)}", *BTN_GENERATE
+        if is_oom_error(e):
+            yield None, get_oom_message(_backend), *BTN_GENERATE
+        else:
+            yield None, f"❌ 오류 발생: {str(e)}", *BTN_GENERATE
     finally:
         _is_generating = False
         _cancel_requested = False
@@ -753,6 +861,9 @@ def create_ui():
     # Image-to-Image 지원 여부 (MLX는 미지원)
     i2i_supported = _backend is not None and _backend != "mlx"
 
+    # 사용 가능한 LoRA 목록
+    available_loras = ["없음"] + scan_loras()
+
     with gr.Blocks() as app:
 
         gr.HTML(f"""
@@ -770,6 +881,56 @@ def create_ui():
                 <p>PyTorch 또는 MLX를 설치해주세요.</p>
             </div>
             """)
+
+        # ============================================================
+        # LoRA 설정 섹션 (공유)
+        # ============================================================
+        with gr.Accordion("🎨 LoRA 설정", open=False):
+            gr.Markdown("loras/ 폴더에 .safetensors 파일을 넣으면 자동으로 인식됩니다.")
+            
+            with gr.Row():
+                with gr.Column():
+                    lora1 = gr.Dropdown(
+                        label="LoRA 1",
+                        choices=available_loras,
+                        value="없음",
+                    )
+                    lora1_scale = gr.Slider(
+                        label="강도",
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.1,
+                    )
+                with gr.Column():
+                    lora2 = gr.Dropdown(
+                        label="LoRA 2",
+                        choices=available_loras,
+                        value="없음",
+                    )
+                    lora2_scale = gr.Slider(
+                        label="강도",
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.1,
+                    )
+                with gr.Column():
+                    lora3 = gr.Dropdown(
+                        label="LoRA 3",
+                        choices=available_loras,
+                        value="없음",
+                    )
+                    lora3_scale = gr.Slider(
+                        label="강도",
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.1,
+                    )
+            
+            if not scan_loras():
+                gr.Markdown("⚠️ loras/ 폴더에 LoRA 파일이 없습니다.")
 
         with gr.Tabs():
             # ============================================================
@@ -988,16 +1149,19 @@ def create_ui():
         # 이벤트 연결
         # ============================================================
 
+        # LoRA 입력 리스트
+        lora_inputs = [lora1, lora1_scale, lora2, lora2_scale, lora3, lora3_scale]
+
         # Text-to-Image 이벤트
         generate_btn_t2i.click(
             fn=generate_image,
-            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i, upscale_t2i],
+            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i, upscale_t2i] + lora_inputs,
             outputs=[output_image_t2i, status_t2i, generate_btn_t2i, cancel_btn_t2i],
         )
 
         prompt_t2i.submit(
             fn=generate_image,
-            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i, upscale_t2i],
+            inputs=[prompt_t2i, width_t2i, height_t2i, num_steps_t2i, seed_t2i, save_image_t2i, upscale_t2i] + lora_inputs,
             outputs=[output_image_t2i, status_t2i, generate_btn_t2i, cancel_btn_t2i],
         )
 
@@ -1010,7 +1174,7 @@ def create_ui():
         # Image-to-Image 이벤트
         generate_btn_i2i.click(
             fn=generate_image_i2i,
-            inputs=[prompt_i2i, init_image, strength, num_steps_i2i, seed_i2i, save_image_i2i, upscale_i2i],
+            inputs=[prompt_i2i, init_image, strength, num_steps_i2i, seed_i2i, save_image_i2i, upscale_i2i] + lora_inputs,
             outputs=[output_image_i2i, status_i2i, generate_btn_i2i, cancel_btn_i2i],
         )
 

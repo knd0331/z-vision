@@ -17,12 +17,20 @@
 - **PR #12815**: Flux2ImageProcessor AttributeError 수정 (리뷰 대기 중)
 - **이슈 #12809**: Kandinsky5 CUDA 하드코딩 문제 제기 (PR #12814에서 해결됨)
 
+## ✅ 추가 완료 (2025-12-19)
+| # | 항목 | 구현 방법 |
+|---|------|----------|
+| 10 | **OOM 예외 처리** | `is_oom_error()` + `get_oom_message()` 헬퍼 함수 |
+| 11 | **ETA 표시** | `make_progress_callback()`에 시간 측정 로직 추가 |
+| 12 | **LoRA UI 동적 선택** | `scan_loras()` + Accordion UI + 3개 슬롯 |
+
 ## ❌ 남은 개선점
 | # | 항목 | 우선순위 | 설명 |
 |---|------|----------|------|
-| 1 | 예상 시간(ETA) 표시 | 중간 | 첫 스텝 시간 측정 → 남은 시간 계산 표시 |
-| 2 | MLX Progress Bar | 낮음 | MFLUX 콜백 지원 여부 확인 필요 |
-| 3 | MLX 취소 기능 | 낮음 | MFLUX 중단 메커니즘 확인 필요 |
+| 1 | MLX Progress Bar | 낮음 | MFLUX 콜백 미지원 (라이브러리 업데이트 대기) |
+| 2 | MLX 취소 기능 | 낮음 | MFLUX 중단 메커니즘 미지원 |
+
+
 
 ## 구현 노트
 
